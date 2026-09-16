@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ascend 分页注意力 Lightning Indexer 的 TLE 实现。
+"""TLE implementation of the Ascend paged-attention Lightning Indexer.
 
-实现按语义分为三条路径：短 K 直接生成完整索引；单 token 长 K 沿 K 维并行生成
-512-key proposal；多 token 长 K 沿 query 行并行生成相同 proposal。两条长 K 路径
-共用保持 score/index pair 的 Stage2 归并树。
+Dispatch is split into three semantic paths: short K directly materializes the full
+index set; single-token long K builds 512-key proposals in parallel along K while
+multi-token long K builds them along query rows; both share the Stage2 merge tree.
 
-每个 proposal 使用两个 FP32 word 保存：score 和按位编码的 INT32 key index。
-中间归并必须同时保留这两个 word，只有最终 TopK 完成后才能只输出 index。
-排序、归并和解包复用 FlagTree PR #1065 提供的公共 proposal CustomOp。
+Each proposal is stored as two FP32 words: the score and a bit-packed INT32 key
+index. Intermediate merges must keep both; only the final TopK step emits the
+index alone. Sorting, merging, and unpacking reuse the FlagTree PR #1065 CustomOps.
 """
 
 import torch
@@ -45,7 +45,7 @@ else:
 
 pipe = al.PIPE
 _COMPILER_OPTIONS = {
-    "use_bytecode": True,  # CustomOp bitcode 由安装的 PR 工具链统一提供
+    "use_bytecode": True,  # CustomOp bitcode is provided by the installed PR toolchain
     "enable_auto_bind_sub_block": False,
     "enable_ubuf_saving": True,
 }
@@ -81,30 +81,30 @@ def lightning_indexer_tnd_pa_stage1_kernel(
     SINGLE_REQ_EXTRA_CORES: tl.constexpr = 0,
     SINGLE_REQ_PREFIX_ROWS: tl.constexpr = 0,
 ):
-    """为多 token 长 K query 行构造有序的 512-key proposal 列表。
+    """Build sorted 512-key proposal lists for multi-token long-K query rows.
 
-    每个 MIX program 负责 ``Q_TILE`` 行。Cube 按 128-key block 计算 QK，两个 AIV
-    sub-block 对 head 加权归约、用 ``-inf`` 屏蔽尾块无效位置，并输出紧凑 proposal。
-    Stage2 归并时继续保留 score word。
+    Each MIX program owns ``Q_TILE`` rows. The Cube computes QK in 128-key blocks;
+    two AIV sub-blocks reduce over heads with weights and mask invalid tail lanes
+    with ``-inf``. The score word is kept for the Stage2 merge.
     """
 
     T_TILE: tl.constexpr = (
-        2  # 单次 Cube 计算两行 query，匹配两个 AIV sub-block 的消费节奏
+    2  # one Cube pass computes two query rows, matching the two AIV sub-blocks
     )
-    wsp_nstride: tl.constexpr = C_TILE * K_TILE  # 一个局部排序组固定覆盖 512 个 key
+    wsp_nstride: tl.constexpr = C_TILE * K_TILE  # one local sort group always covers 512 keys
     wsp_mstride: tl.constexpr = (
         T_TILE * query_head_num * wsp_nstride
-    )  # 两行 QK 的 workspace 跨度
+    )  # workspace stride for two rows of QK
     m_coef: tl.constexpr = (
         Q_TILE // al.sub_vec_num()
-    )  # 每个 AIV sub-block 实际负责的 query 行数
-    q_step: tl.constexpr = Q_TILE // T_TILE  # 一个 query tile 需要的 Cube 批次数
-    N_TILE: tl.constexpr = 16  # 以 16 个 head 为一组做向量加权归约
-    n_step: tl.constexpr = query_head_num // N_TILE  # 覆盖全部 query head 的归约次数
-    core_nums = tl.num_programs(0)  # 使用实际 launch grid 计算跨轮 query 步长
+    )  # query rows actually owned by each AIV sub-block
+    q_step: tl.constexpr = Q_TILE // T_TILE  # Cube batches needed per query tile
+    N_TILE: tl.constexpr = 16  # reduce heads in groups of 16
+    n_step: tl.constexpr = query_head_num // N_TILE  # reductions needed to cover all heads
+    core_nums = tl.num_programs(0)  # derive the cross-round query stride from the actual grid
     core_id = tl.program_id(0)
     b = 0
-    t_i = core_id * Q_TILE  # 先按 grid 分配 query tile，再映射到累计 TND request
+    t_i = core_id * Q_TILE  # assign query tiles by grid first, then map to cumulative TND requests
     pre_len_q = 0
     cur_len_q = tl.load(seq_lens_q_ptr)
     seq_len_q = cur_len_q
@@ -122,7 +122,7 @@ def lightning_indexer_tnd_pa_stage1_kernel(
                     short_core_id = core_id - SINGLE_REQ_EXTRA_CORES
                     t_i = SINGLE_REQ_PREFIX_ROWS + short_core_id * Q_TILE
                     query_stride = (core_nums - SINGLE_REQ_EXTRA_CORES) * Q_TILE
-            # 两段路径使用host constexpr，删除设备端整除和取模
+            # the two-segment path uses host constexprs, dropping device-side div/mod
         else:
             query_tiles = (cur_len_q + Q_TILE - 1) // Q_TILE
             base_tiles = query_tiles // core_nums
@@ -138,13 +138,13 @@ def lightning_indexer_tnd_pa_stage1_kernel(
                     t_i = (prefix_tiles + short_core_id) * Q_TILE
                     query_stride = (core_nums - extra_tiles) * Q_TILE
                     schedule_end_q = query_tiles * Q_TILE
-            # 非两段特化路径保留设备端两池调度，覆盖任意 query tile 数
+            # the generic path keeps device-side two-pool scheduling for any tile count
     tmp_buf = tl.zeros([wsp_nstride * 4], dtype=tl.float32)
     sorted_pairs_buf = tl.zeros([2 * wsp_nstride], dtype=tl.float32)
     for i in tl.static_range(MB):
         al.sync_block_set(
             "vector", "cube", i, pipe.PIPE_MTE2, pipe.PIPE_FIX
-        )  # 首轮先把每个环形槽标记为 Cube 可写
+        )  # mark every ring slot Cube-writable before the first round
     db_flag = 0
     if REQ_NUM > 1:
         while t_i >= cur_len_q and b < REQ_NUM - 1:
@@ -152,7 +152,7 @@ def lightning_indexer_tnd_pa_stage1_kernel(
             if q_tail:
                 t_i -= (
                     Q_TILE - q_tail
-                )  # TND request 尾块不足 Q_TILE 时回退到下一段真实起点
+            )  # back up to the next segment real start when a TND tail block is short of Q_TILE
             b += 1
             pre_len_q = cur_len_q
             cur_len_q = tl.load(seq_lens_q_ptr + b)
@@ -163,10 +163,10 @@ def lightning_indexer_tnd_pa_stage1_kernel(
     while b < REQ_NUM:
         act_len_k = (
             cur_len_k - (cur_len_q - t_i) + 1
-        )  # sparse_mode=3 的 causal 对齐长度
+        )  # causal-aligned length for sparse_mode=3
         k_blk_cnt = (
             (act_len_k + K_TILE - 1) // K_TILE if act_len_k + Q_TILE - 1 > TOPK else 0
-        )  # TopK 已覆盖的行无需排序
+        )  # rows already covered by TopK need no sorting
         q_block_0 = tl.load(
             q_ptr
             + t_i * stride_qt
@@ -185,7 +185,7 @@ def lightning_indexer_tnd_pa_stage1_kernel(
         weight_rows = t_i + m_coef * al.sub_vec_id() + weight_lanes // query_head_num
         weight_offsets = (
             weight_rows * stride_wt + weight_lanes % query_head_num
-        )  # 按真实行 stride 跳过 token 间 padding
+        )  # skip inter-token padding via the real row stride
         weight_block = tl.load(
             weights_ptr + weight_offsets,
             mask=weight_rows < cur_len_q,
@@ -203,16 +203,16 @@ def lightning_indexer_tnd_pa_stage1_kernel(
         for k_t in tl.range(0, k_blk_cnt, C_TILE):
             core_offset = (
                 q_step * wsp_mstride * (core_nums * (db_flag % MB) + core_id)
-            )  # MB 环形槽按 program 隔离
+            )  # MB ring slots are isolated per program
             remain_k_blk_cnt = k_blk_cnt - k_t
             k_itr = C_TILE if remain_k_blk_cnt >= C_TILE else remain_k_blk_cnt
             al.sync_block_wait(
                 "vector", "cube", (db_flag % MB), pipe.PIPE_MTE2, pipe.PIPE_FIX
-            )  # Cube 重用槽前等待 AIV 消费完成
+            )  # wait for AIV consumption before the Cube reuses a slot
             for k_i in range(k_itr):
                 actual_k_block_i = tl.load(
                     block_table_ptr + b * stride_block_table_b + k_t + k_i
-                )  # 通过 block table 做分页间接寻址
+                )  # paged indirection through the block table
                 k_block_ptr = tl.make_block_ptr(
                     base=k_ptr + actual_k_block_i * stride_kbn,
                     shape=(K_TILE, head_dim),
@@ -247,7 +247,7 @@ def lightning_indexer_tnd_pa_stage1_kernel(
 
             al.sync_block_set(
                 "cube", "vector", (db_flag % MB), pipe.PIPE_FIX, pipe.PIPE_MTE2
-            )  # 发布本槽 QK 数据给 AIV
+            )  # publish this slot QK data to the AIV
             in_offset = core_offset + tl.arange(0, N_TILE * wsp_nstride)
             if OUTPUT_RAW_SCORES:
                 out_offsets = (
@@ -263,7 +263,7 @@ def lightning_indexer_tnd_pa_stage1_kernel(
                 )
             al.sync_block_wait(
                 "cube", "vector", (db_flag % MB), pipe.PIPE_FIX, pipe.PIPE_MTE2
-            )  # AIV 读取前等待 Cube 写完
+            )  # wait for the Cube write before the AIV reads
             for q_i in range(q_itr_b, q_itr):
                 qk_slice = tl.load(
                     wsp_ptr
@@ -354,7 +354,7 @@ def lightning_indexer_tnd_pa_stage1_kernel(
                         < act_len_k + m_coef * al.sub_vec_id() + q_i,
                         tmp_reduce_res_block,
                         float("-inf"),
-                    )  # 尾组无效 lane 必须排在所有真实 score 之后
+                    )  # invalid lanes of the tail group must sort after all real scores
                 if OUTPUT_RAW_SCORES:
                     tl.store(
                         out_ptr
@@ -369,7 +369,7 @@ def lightning_indexer_tnd_pa_stage1_kernel(
                         tmp_buf,
                         True,
                         wsp_nstride,
-                        k_t * K_TILE,  # proposal index 必须包含当前 512-key 分组偏移
+                        k_t * K_TILE,  # the proposal index must include the 512-key group offset
                         SORT_IMPL_BASE,
                         out=sorted_pairs_buf,
                     )
@@ -382,14 +382,14 @@ def lightning_indexer_tnd_pa_stage1_kernel(
 
             al.sync_block_set(
                 "vector", "cube", (db_flag % MB), pipe.PIPE_MTE2, pipe.PIPE_FIX
-            )  # AIV 完成后归还环形槽
+            )  # return the ring slot after the AIV finishes
             db_flag += 1
-        t_i += query_stride  # 单请求负载均衡路径按各自 core pool 的 stride 领取下一块
+        t_i += query_stride  # single-request load-balancing path claims the next tile by its pool stride
         if REQ_NUM > 1:
             while t_i >= cur_len_q and b < REQ_NUM - 1:
                 q_tail = seq_len_q % Q_TILE
                 if q_tail:
-                    t_i -= Q_TILE - q_tail  # 跨 request 时消除上一段尾块造成的累计空洞
+                    t_i -= Q_TILE - q_tail  # drop the hole left by the previous tail when crossing requests
                 b += 1
                 pre_len_q = cur_len_q
                 cur_len_q = tl.load(seq_lens_q_ptr + b)
@@ -400,7 +400,7 @@ def lightning_indexer_tnd_pa_stage1_kernel(
     for i in tl.static_range(MB):
         al.sync_block_wait(
             "vector", "cube", i, pipe.PIPE_MTE2, pipe.PIPE_FIX
-        )  # 退出前等待所有 AIV consumer 归还槽位
+        )  # wait for all AIV consumers to return their slots before exiting
 
 
 @triton.jit
@@ -418,7 +418,7 @@ def lightning_indexer_tnd_pa_prefill_sort_4096_top512_kernel(
     OUTPUT_INDICES: tl.constexpr,
     TOPK: tl.constexpr = 512,
 ):
-    """将 GM 中的 4096-score segment 裁剪为 Top512 proposal。"""
+    """Trim a 4096-score GM segment down to a Top512 proposal."""
 
     SEGMENT_KEYS: tl.constexpr = 4096
     PAIR_WORDS: tl.constexpr = 2 * TOPK
@@ -499,14 +499,14 @@ def lightning_indexer_tnd_pa_prefill_sort_merge_8192_top512_kernel(
     SINGLE_REQ_KEY_TOKENS: tl.constexpr = 0,
     TOPK: tl.constexpr = 512,
 ):
-    """用公共 base sort 一次处理 8192 score并输出全局 Top512。"""
+    """Process 8192 scores in one base sort and emit the global Top512."""
 
     TOTAL_KEYS: tl.constexpr = 8192
     PAIR_WORDS: tl.constexpr = 2 * TOPK
     SORT_TMP_WORDS: tl.constexpr = 4 * TOTAL_KEYS
     tl.static_assert(TOPK == 512)
 
-    t_i = tl.program_id(0)  # 每个 Vector program 独占一行，避免 proposal 跨行共享
+    t_i = tl.program_id(0)  # one row per Vector program so proposals are never shared
     b = 0
     if HOST_SPECIALIZE_SINGLE_REQ_LENGTHS:
         cur_len_q = SINGLE_REQ_QUERY_ROWS
@@ -542,7 +542,7 @@ def lightning_indexer_tnd_pa_prefill_sort_merge_8192_top512_kernel(
             0,
             SORT_IMPL_BASE,
             out=top_pairs,
-        )  # 一次全局排序避免两条proposal及额外二路归并
+        )  # one global sort avoids two proposals plus an extra two-way merge
         final_values = tl.zeros([TOPK], dtype=tl.float32)
         final_indices = tl.zeros([TOPK], dtype=tl.int32)
         final_values, final_indices = tle.dsa.ascend.raw(
@@ -579,30 +579,30 @@ def lightning_indexer_tnd_pa_decode_stage1_kernel(
     K_TILE: tl.constexpr = 128,
     TOPK: tl.constexpr = 2048,
 ):
-    """为单个 decode token 的每个 512-key 分组构造一条紧凑 proposal 列表。
+    """Build one compact proposal list per 512-key group for a single decode token.
 
-    Host 已解析出该 token 唯一所属的 request，并传入对应 block-table 行。grid 使用真实
-    K-group 数，因此即使 group 数超过 AI Core 数，也能独立覆盖全部 key。
+    The host resolves the token's single owning request and passes its block-table row.
+    The grid uses the real K-group count, covering all keys even when they outnumber AI Cores.
     """
-    T_TILE: tl.constexpr = 2  # 保持与通用 Stage1 相同的 Cube tile 形状
-    Q_TILE: tl.constexpr = 4  # 保持已验证的 MIX 静态布局，实际只归约 token 0
-    N_TILE: tl.constexpr = 16  # 每次向量归约 16 个 query head
+    T_TILE: tl.constexpr = 2  # keep the same Cube tile shape as the generic Stage1
+    Q_TILE: tl.constexpr = 4  # keep the verified static MIX layout; only token 0 is reduced
+    N_TILE: tl.constexpr = 16  # reduce 16 query heads per vector pass
     wsp_nstride: tl.constexpr = (
         C_TILE * K_TILE
-    )  # 每个 program 覆盖一个 512-key proposal 组
+    )  # each program covers one 512-key proposal group
     wsp_mstride: tl.constexpr = T_TILE * query_head_num * wsp_nstride
     m_coef: tl.constexpr = Q_TILE // al.sub_vec_num()
     q_step: tl.constexpr = Q_TILE // T_TILE
     n_step: tl.constexpr = query_head_num // N_TILE
 
     core_id = tl.program_id(0)
-    k_t = core_id * C_TILE  # 一个 program 独占一个 K group，补足单 token 下的并行度
+    k_t = core_id * C_TILE  # one K group per program restores parallelism for a single token
     tmp_buf = tl.zeros([wsp_nstride * 4], dtype=tl.float32)
     sorted_pairs_buf = tl.zeros([2 * wsp_nstride], dtype=tl.float32)
 
     al.sync_block_set(
         "vector", "cube", 0, pipe.PIPE_MTE2, pipe.PIPE_FIX
-    )  # 首次 Cube 写 workspace 前声明槽可用
+    )  # declare the slot writable before the first Cube store
     q_rows = tl.arange(0, T_TILE * query_head_num)
     q_block_0 = tl.load(
         q_ptr + (q_rows * stride_qn)[:, None] + tl.arange(0, head_dim)[None, :]
@@ -618,7 +618,7 @@ def lightning_indexer_tnd_pa_decode_stage1_kernel(
     weight_rows = m_coef * al.sub_vec_id() + weight_lanes // query_head_num
     weight_offsets = (
         weight_rows * stride_wt + weight_lanes % query_head_num
-    )  # 使用真实 stride，不能假设 token 行紧密连续
+    )  # use real strides; token rows must not be assumed densely packed
     weight_block = tl.load(
         weights_ptr + weight_offsets,
         mask=weight_rows < 1,
@@ -630,11 +630,11 @@ def lightning_indexer_tnd_pa_decode_stage1_kernel(
     k_itr = C_TILE if remain_k_blk_cnt >= C_TILE else remain_k_blk_cnt
     al.sync_block_wait(
         "vector", "cube", 0, pipe.PIPE_MTE2, pipe.PIPE_FIX
-    )  # Cube 覆盖 workspace 前等待槽位可写
+        )  # wait for a writable slot before the Cube overwrites the workspace
     for k_i in range(k_itr):
         actual_k_block_i = tl.load(
             block_table_ptr + k_t + k_i
-        )  # 指针已定位到 active request 的 block-table 行
+        )  # pointer already targets the active request block-table row
         k_block_ptr = tl.make_block_ptr(
             base=k_ptr + actual_k_block_i * stride_kbn,
             shape=(K_TILE, head_dim),
@@ -666,12 +666,12 @@ def lightning_indexer_tnd_pa_decode_stage1_kernel(
 
     al.sync_block_set(
         "cube", "vector", 0, pipe.PIPE_FIX, pipe.PIPE_MTE2
-    )  # 发布完整 512-key QK tile
+        )  # publish the complete 512-key QK tile
     in_offset = core_offset + tl.arange(0, N_TILE * wsp_nstride)
     out_offsets = 2 * k_t * K_TILE + tl.arange(0, 2 * wsp_nstride)
     al.sync_block_wait(
         "cube", "vector", 0, pipe.PIPE_FIX, pipe.PIPE_MTE2
-    )  # AIV 归约前等待完整 QK tile 发布
+        )  # wait for the full QK tile before the AIV reduction
 
     q_itr = 0
     q_itr_b = 0
@@ -709,14 +709,14 @@ def lightning_indexer_tnd_pa_decode_stage1_kernel(
                 k_t * K_TILE + tl.arange(0, wsp_nstride) < ACT_LEN_K,
                 scores,
                 float("-inf"),
-            )  # decode 尾组无效 lane 必须以 -inf 退出 TopK 竞争
+            )  # invalid tail lanes must leave TopK contention with -inf in decode
         sorted_pairs_buf = tle.dsa.ascend.raw(
             "sort_1d_pack",
             tl.reshape(scores, (wsp_nstride,)),
             tmp_buf,
             True,
             wsp_nstride,
-            k_t * K_TILE,  # 公共 sort 在设备侧生成带全局偏移的 index
+            k_t * K_TILE,  # the shared sort emits device-side indices with the global offset
             SORT_IMPL_BASE,
             out=sorted_pairs_buf,
         )
@@ -724,10 +724,10 @@ def lightning_indexer_tnd_pa_decode_stage1_kernel(
 
     al.sync_block_set(
         "vector", "cube", 0, pipe.PIPE_MTE2, pipe.PIPE_FIX
-    )  # 显式闭合 MIX 同步边
+    )  # explicitly close the MIX sync edge
     al.sync_block_wait(
         "vector", "cube", 0, pipe.PIPE_MTE2, pipe.PIPE_FIX
-    )  # 等待最终 proposal 写出完成
+        )  # wait for the final proposal write-out
 
 
 @triton.jit
@@ -738,11 +738,11 @@ def lightning_indexer_tnd_pa_direct_indices_kernel(
     REQ_NUM: tl.constexpr,
     TOP_K: tl.constexpr = 512,
 ):
-    """当 TopK 覆盖全部有效 key 时，直接物化完整索引集合。
+    """Materialize the full index set directly when TopK covers all valid keys.
 
-    sparse_mode=3 使用 causal 对齐，行 ``t`` 的有效长度为
-    ``key_end - (query_end - t) + 1``。完整 TopK 集合就是 ``[0, act_len_k)``
-    后接 ``-1`` padding，无需计算 score。
+    sparse_mode=3 uses causal alignment: row ``t`` has
+    ``key_end - (query_end - t) + 1`` valid keys. The full TopK set is simply
+    ``[0, act_len_k)`` followed by ``-1`` padding; no scores are needed.
     """
     core_nums = tl.num_programs(0)
     t_i = tl.program_id(0)
@@ -761,10 +761,10 @@ def lightning_indexer_tnd_pa_direct_indices_kernel(
     while b < REQ_NUM:
         act_len_k = (
             cur_len_k - (cur_len_q - t_i) + 1
-        )  # 与长 K 路径保持相同的 causal 有效长度
+        )  # same causal valid length as the long-K paths
         indices = tl.where(
             lanes < act_len_k, lanes, -1
-        )  # TopK 覆盖全集时，顺序 index 即为精确集合
+        )  # with TopK covering everything, sequential indices are the exact set
         tl.store(o_ptr + t_i * TOP_K + lanes, indices)
 
         t_i += core_nums
@@ -792,22 +792,22 @@ def lightning_indexer_tnd_pa_stage2_top512_merge_pairs_kernel(
     TOP_K: tl.constexpr = 512,
     OUTPUT_INDICES: tl.constexpr = False,
 ):
-    """执行 TopK=512 pair-preserving GM 归并树的一层。
+    """Execute one layer of the TopK=512 pair-preserving GM merge tree.
 
-    每个 program 独占一个 ``(query row, output group)`` task，归并一至四条相邻有序
-    list。非最终层写完整紧凑 pair，只有最终层物化 index；后续层仍需跨组比较 score。
+    Each program owns one ``(query row, output group)`` task and merges one to four
+    adjacent sorted lists; only the final layer may drop scores and emit raw indices.
     """
     V_I: tl.constexpr = 2
-    MERGE_WAYS: tl.constexpr = 4  # 四路归并是在当前 UB 约束下验证通过的最大 fan-in
-    LIST_WORDS: tl.constexpr = V_I * TOP_K  # score/index_bits 必须成对跨 GM 层保存
+    MERGE_WAYS: tl.constexpr = 4  # four-way merge is the largest verified fan-in under the UB budget
+    LIST_WORDS: tl.constexpr = V_I * TOP_K  # score/index_bits must stay paired across GM layers
     MERGE_PROPS: tl.constexpr = MERGE_WAYS * TOP_K
     MERGE_WORDS: tl.constexpr = V_I * MERGE_PROPS
 
     task_id = task_base + tl.program_id(
         0
-    )  # grid 等于真实 merge task 数，不能按 AI Core 数截断
-    t_i = task_id // OUTPUT_GROUPS  # 高维映射 query 行
-    group_id = task_id % OUTPUT_GROUPS  # 低维映射该行的输出分组，包含尾组
+    )  # grid equals the real merge-task count; do not truncate to the AI-Core count
+    t_i = task_id // OUTPUT_GROUPS  # high dimension maps to the query row
+    group_id = task_id % OUTPUT_GROUPS  # low dimension maps to the row output group, tail included
     b = 0
     cur_len_q = tl.load(seq_lens_q_ptr)
     if REQ_NUM > 1:
@@ -815,15 +815,15 @@ def lightning_indexer_tnd_pa_stage2_top512_merge_pairs_kernel(
             b += 1
             cur_len_q = tl.load(seq_lens_q_ptr + b)
     cur_len_k = tl.load(seq_lens_k_ptr + b)
-    act_len_k = cur_len_k - (cur_len_q - t_i) + 1  # 每行按 causal 语义独立计算有效 K
+    act_len_k = cur_len_k - (cur_len_q - t_i) + 1  # each row computes its valid K per causal semantics
     valid_input_lists = tl.cdiv(
         act_len_k, INPUT_SPAN
-    )  # list 覆盖范围由 Stage1 proposal 粒度决定，禁止 GM padding 参与候选
-    for _ in tl.static_range(ROUND):  # 每经过一层四路树，合法输入 list 数按四归一
+    )  # list coverage follows the Stage1 proposal granularity; GM padding must not compete
+    for _ in tl.static_range(ROUND):  # each four-way layer folds the valid input-list count by four
         valid_input_lists = tl.cdiv(valid_input_lists, MERGE_WAYS)
     group_input_begin = (
         group_id * MERGE_WAYS
-    )  # 每个 task 只读取自己负责的连续一至四条 list
+    )  # each task reads only its own one-to-four contiguous lists
     group_input_lists = tl.maximum(
         0,
         tl.minimum(
@@ -836,11 +836,11 @@ def lightning_indexer_tnd_pa_stage2_top512_merge_pairs_kernel(
     )
     if (
         OUTPUT_INDICES and act_len_k <= TOP_K
-    ):  # 最终层保留短 K 防御分支，直接输出精确集合
+    ):  # the final layer keeps the short-K defensive branch and emits the exact set
         lanes = tl.arange(0, TOP_K)
         short_indices = tl.where(lanes < act_len_k, lanes, -1)
         tl.store(output_proposal_ptr + t_i * TOP_K + lanes, short_indices)
-    elif group_input_lists == 0:  # padding task 不得读取越界 proposal，只写合法哨兵
+    elif group_input_lists == 0:  # padding tasks must not read out-of-bounds proposals; legal sentinels only
         if OUTPUT_INDICES:
             lanes = tl.arange(0, TOP_K)
             tl.store(
@@ -852,7 +852,7 @@ def lightning_indexer_tnd_pa_stage2_top512_merge_pairs_kernel(
                 output_proposal_ptr + output_offsets,
                 tl.full([LIST_WORDS], float("-inf"), tl.float32),
             )
-    elif group_input_lists == 1:  # 单路尾组无需归并，但中间层仍要复制完整 pair
+    elif group_input_lists == 1:  # a single-list tail needs no merge, but middle layers still copy full pairs
         if OUTPUT_INDICES:
             lanes = tl.arange(0, TOP_K)
             singleton_index_words = tl.load(
@@ -918,7 +918,7 @@ def lightning_indexer_tnd_pa_stage2_top512_merge_pairs_kernel(
             tl.arange(0, LIST_WORDS) < 2 * produced,
             top_pairs,
             float("-inf"),
-        )  # exhaustion merge 只保证 consumed 对应的前缀有效
+        )  # the exhaustion merge only guarantees the consumed prefix is valid
         if OUTPUT_INDICES:
             final_values = tl.zeros([TOP_K], dtype=tl.float32)
             final_indices = tl.zeros([TOP_K], dtype=tl.int32)
@@ -952,11 +952,11 @@ def lightning_indexer(
     next_tokens: int = 9223372036854775807,
     return_value: bool = False,
 ):
-    """按语义区域和工作负载 shape 分流 Lightning Indexer。
+    """Dispatch the Lightning Indexer by semantic region and workload shape.
 
-    当前路由 request 的有效 K 不超过 ``sparse_count`` 时直接生成精确索引；单 query
-    token 的长 K 使用 K-parallel Stage1，其他长 K 使用 query-parallel Stage1。长 K
-    的局部排序和四路归并树使用 FlagTree PR #1065 的公共 proposal CustomOp。
+    Exact indices are emitted directly when the current request's valid K fits within
+    ``sparse_count``; single-token long K uses the K-parallel Stage1 and other long K
+    the query-parallel Stage1, both built on the FlagTree PR #1065 CustomOps.
     """
 
     if tle is None:
@@ -1029,16 +1029,16 @@ def lightning_indexer(
         raise NotImplementedError("key must use block_size=128, one head, head_dim=128")
     if weights.shape != (total_query_seqs, query_head_num):
         raise ValueError("weights must match query token and head dimensions")
-    K_TILE = block_size  # K tile 必须与分页 cache 的 block size 一致
-    C_TILE = 4  # 每条局部 proposal 合并四个物理 block
-    base_block = K_TILE * C_TILE  # Stage1 单组固定覆盖 512 个 key
+    K_TILE = block_size  # K tile must match the paged-cache block size
+    C_TILE = 4  # each local proposal merges four physical blocks
+    base_block = K_TILE * C_TILE  # one Stage1 group always covers 512 keys
     req_num = actual_seq_lengths_key.shape[0]
     decode_request = None
     decode_actual_tokens = None
     if total_query_seqs == 1:
         query_ends = [
             int(value) for value in actual_seq_lengths_query.detach().cpu().tolist()
-        ]  # 单 token dispatch 只读取小型累计长度元数据，不用 Torch 计算输出
+        ]  # single-token dispatch reads only the small cumulative-length metadata, no Torch ops
         key_lengths = [
             int(value) for value in actual_seq_lengths_key.detach().cpu().tolist()
         ]
@@ -1055,10 +1055,10 @@ def lightning_indexer(
             )
         decode_request = active_requests[
             0
-        ]  # 单 token 仍可能位于多 request 元数据中的任意一行
+        ]  # the single token may still sit in any row of the multi-request metadata
         decode_actual_tokens = key_lengths[
             decode_request
-        ]  # K-parallel kernel 只读取所属 request 的长度
+        ]  # the K-parallel kernel reads only its own request length
         max_actual_tokens = max(key_lengths)
     else:
         max_actual_tokens = int(actual_seq_lengths_key.max().item())
@@ -1068,8 +1068,8 @@ def lightning_indexer(
     )
     USED_CORES = int(
         device_properties["num_aicore"]
-    )  # 运行时读取硬件资源上限，避免绑定某张卡
-    Q_TILE = 4  # 每个 prefill MIX program 负责四行 query
+    )  # query the hardware limit at runtime instead of hardcoding one board
+    Q_TILE = 4  # each prefill MIX program owns four query rows
     output = torch.empty(
         (total_query_seqs, 1, sparse_count),
         dtype=torch.int32,
@@ -1077,12 +1077,12 @@ def lightning_indexer(
     )
     values = torch.empty(
         (0,), dtype=query.dtype, device=query.device
-    )  # 对齐官方 return_value=False 时仍返回空 value Tensor 的二元组契约
+    )  # match the official two-tuple contract: an empty value Tensor when return_value=False
 
     route_tokens = (
         decode_actual_tokens if total_query_seqs == 1 else max_actual_tokens
     )
-    if route_tokens <= sparse_count:  # TopK 覆盖当前有效 request 时无需排序
+    if route_tokens <= sparse_count:  # no sorting needed once TopK covers the active request
         lightning_indexer_tnd_pa_direct_indices_kernel[(USED_CORES,)](
             actual_seq_lengths_query,
             actual_seq_lengths_key,
@@ -1095,14 +1095,14 @@ def lightning_indexer(
 
     proposal_input_span = (
         base_block if total_query_seqs == 1 else 4096
-    )  # decode 保留 512-key list；prefill 每条 list 覆盖一个 4096-key segment
+    )  # decode keeps 512-key lists; each prefill list covers a 4096-key segment
     max_proposal_lists = (
         max_actual_tokens + proposal_input_span - 1
     ) // proposal_input_span
     max_proposal_tokens = max_proposal_lists * sparse_count
     MB = (
         3 if total_query_seqs > 1 and max_proposal_lists == 2 else 2
-    )  # 两段 prefill 才用三槽，其他路径保持低开销
+    )  # only the two-segment prefill uses three slots; other paths stay lean
     single_req_extra_cores = 0
     single_req_prefix_rows = 0
     host_specialize_causal_schedule = (
@@ -1114,7 +1114,7 @@ def lightning_indexer(
         single_req_extra_cores = query_tiles % USED_CORES
         single_req_prefix_rows = (
             single_req_extra_cores * (base_tiles + 1) * Q_TILE
-        )  # 用真实query行数和动态core数生成两池边界
+        )  # derive the two-pool boundary from the real query-row count and dynamic core count
     out = torch.empty(
         (total_query_seqs, 2 * max_proposal_tokens),
         dtype=torch.float32,
@@ -1128,14 +1128,14 @@ def lightning_indexer(
             (total_query_seqs, max_proposal_lists * proposal_input_span),
             dtype=torch.float32,
             device=query.device,
-        )  # MIX 只写 512-score chunk，避免在同一 IR 中拼接 4096-score SSA tensor
-    # QK 在 head reduction 前必须保持 FP32；缩窄到 FP16 会改变部分行的 TopK 集合。
+        )  # MIX writes 512-score chunks, avoiding a 4096-score SSA tensor splice in one IR
+    # QK must stay FP32 before head reduction; narrowing to FP16 changes some rows TopK sets.
     qk_workspace_dtype = torch.float32
     groupwise_fp32_reduction = (
         req_num == 1
         and total_query_seqs > 1
         and max_proposal_lists == 2
-    )  # 分组归约只在当前 Stage1 瓶颈路径启用，其他路径保持原树
+    )  # grouped reduction is enabled only on the current Stage1 bottleneck path
     wsp = torch.empty(
         (MB * USED_CORES * Q_TILE * query_head_num * K_TILE * C_TILE),
         dtype=qk_workspace_dtype,
@@ -1147,7 +1147,7 @@ def lightning_indexer(
             k_blk_cnt = (decode_actual_tokens + K_TILE - 1) // K_TILE
             k_group_count = (
                 k_blk_cnt + C_TILE - 1
-            ) // C_TILE  # grid 使用真实 K group 数而非固定 core 数
+            ) // C_TILE  # grid uses the real K-group count instead of a fixed core count
             lightning_indexer_tnd_pa_decode_stage1_kernel[(k_group_count,)](
                 query,
                 key,
@@ -1204,7 +1204,7 @@ def lightning_indexer(
             SINGLE_REQ_EXTRA_CORES=single_req_extra_cores,
             SINGLE_REQ_PREFIX_ROWS=single_req_prefix_rows,
             disable_auto_cv_work_space_manage=True,
-            disable_auto_inject_block_sync=True,  # 本路径已有显式跨核同步，避免自动插入的同步破坏流水重叠
+            disable_auto_inject_block_sync=True,  # explicit cross-core sync; auto-inserted sync would break the pipeline overlap
             unit_flag=False,
             multibuffer=True,
             sync_solver=False,
@@ -1255,27 +1255,27 @@ def lightning_indexer(
     stage2_actual_tokens = (
         decode_actual_tokens if total_query_seqs == 1 else max_actual_tokens
     )
-    merge_ways = 4  # PR CustomOp 最多一次合并四路 proposal
+    merge_ways = 4  # the PR CustomOp merges at most four proposals at once
     input_lists = (
         1
         if fuse_prefill_sort_merge
         else (stage2_actual_tokens + proposal_input_span - 1)
         // proposal_input_span
-    )  # fused 两段路径已经输出最终 index，不再进入 Stage2
-    current_proposals = out  # 首层消费 Stage1 写出的完整 score/index pair
+    )  # the fused two-segment path already emitted final indices; skip Stage2
+    current_proposals = out  # the first layer consumes the full score/index pairs from Stage1
     current_stride = out.stride(
         -2
-    )  # stride 随当前 GM allocation 更新，不能假设连续层布局相同
+    )  # strides follow the current GM allocation; layers must not assume identical layouts
     current_groups = input_lists
     merge_round = 0
     while current_groups > 1:
         output_groups = (current_groups + merge_ways - 1) // merge_ways
         merge_tasks = (
             total_query_seqs * output_groups
-        )  # 1/2/3-list 尾组同样必须获得独立 task
+        )  # 1/2/3-list tail groups also need their own tasks
         final_round = (
             output_groups == 1
-        )  # 最终层之后不再需要 score，可直接写 INT32 index
+        )  # scores are unneeded after the final layer; write INT32 indices directly
         if final_round:
             lightning_indexer_tnd_pa_stage2_top512_merge_pairs_kernel[(merge_tasks,)](
                 current_proposals,
@@ -1316,11 +1316,11 @@ def lightning_indexer(
                 **_COMPILER_OPTIONS,
             )
             current_proposals = (
-                next_proposals  # 非最终层继续传递 pair，不能提前只保留 index
+                next_proposals  # non-final layers keep passing pairs; indices alone would be premature
             )
             current_stride = next_proposals.stride(
                 0
-            )  # 下一层按新 allocation 的行 stride 读取
+            )  # the next layer reads with the new allocation row stride
         current_groups = output_groups
         merge_round += 1
     return output, values
