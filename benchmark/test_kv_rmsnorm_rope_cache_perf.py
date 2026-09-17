@@ -94,10 +94,16 @@ _KWARGS = dict(
 )
 
 
-@pytest.mark.parametrize("name, batch_size, seq_len, dtype", CASES, ids=lambda v: v if isinstance(v, str) else "")
+@pytest.mark.parametrize(
+    "name, batch_size, seq_len, dtype",
+    CASES,
+    ids=lambda v: v if isinstance(v, str) else "",
+)
 @torch.inference_mode()
 def test_kv_rmsnorm_rope_cache_kernel_perf(name, batch_size, seq_len, dtype):
-    kv, gamma, cos, sin, k_cache, ckv_cache, index = _make_inputs(batch_size, seq_len, dtype)
+    kv, gamma, cos, sin, k_cache, ckv_cache, index = _make_inputs(
+        batch_size, seq_len, dtype
+    )
     ref_k_cache = torch.zeros_like(k_cache)
     ref_ckv_cache = torch.zeros_like(ckv_cache)
 

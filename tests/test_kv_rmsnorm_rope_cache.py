@@ -77,7 +77,9 @@ def _make_inputs(batch_size, seq_len, dtype):
     ids=["decode-aligned-fp16", "decode-unaligned-fp16", "prefill-fp16", "decode-bf16"],
 )
 def test_kv_rmsnorm_rope_cache_accuracy(batch_size, seq_len, dtype):
-    kv, gamma, cos, sin, k_cache, ckv_cache, index = _make_inputs(batch_size, seq_len, dtype)
+    kv, gamma, cos, sin, k_cache, ckv_cache, index = _make_inputs(
+        batch_size, seq_len, dtype
+    )
     ref_k_cache = torch.zeros_like(k_cache)
     ref_ckv_cache = torch.zeros_like(ckv_cache)
 
@@ -98,21 +100,23 @@ def test_kv_rmsnorm_rope_cache_accuracy(batch_size, seq_len, dtype):
         is_output_kv=True,
     )
 
-    k_cache_ref, v_cache_ref, k_rope_ref, c_kv_ref = torch_npu.npu_kv_rmsnorm_rope_cache(
-        kv,
-        gamma,
-        cos,
-        sin,
-        index,
-        ref_k_cache,
-        ref_ckv_cache,
-        k_rope_scale=None,
-        c_kv_scale=None,
-        k_rope_offset=None,
-        c_kv_offset=None,
-        epsilon=1e-5,
-        cache_mode="PA_BNSD",
-        is_output_kv=True,
+    k_cache_ref, v_cache_ref, k_rope_ref, c_kv_ref = (
+        torch_npu.npu_kv_rmsnorm_rope_cache(
+            kv,
+            gamma,
+            cos,
+            sin,
+            index,
+            ref_k_cache,
+            ref_ckv_cache,
+            k_rope_scale=None,
+            c_kv_scale=None,
+            k_rope_offset=None,
+            c_kv_offset=None,
+            epsilon=1e-5,
+            cache_mode="PA_BNSD",
+            is_output_kv=True,
+        )
     )
 
     torch.testing.assert_close(k_rope_ref, k_rope, atol=ATOL, rtol=RTOL)

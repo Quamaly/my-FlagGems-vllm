@@ -23,8 +23,8 @@ through the per-token slot ``index``.
 
 import torch
 import triton
-import triton.language as tl
 import triton.experimental.tle as tle
+import triton.language as tl
 
 RMS_SIZE = 512
 ROPE_SIZE = 64
@@ -78,20 +78,38 @@ def _apply_rotary_pos_emb_kernel(
 
     # Load the first and second halves of the RoPE input.
     x = tl.load(q_ptr + x_offset + offsets_all, mask=mask_batch, other=0.0)
-    x1 = tle.dsa.extract_slice(x, (0, 0), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 2))
-    x2 = tle.dsa.extract_slice(x, (0, 1), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 2))
+    x1 = tle.dsa.extract_slice(
+        x, (0, 0), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 2)
+    )
+    x2 = tle.dsa.extract_slice(
+        x, (0, 1), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 2)
+    )
 
     # cos/sin layout: [BLOCK_SIZE_TOKEN, HEAD_DIM], stride [HEAD_DIM, 1]
     cos_tile = tl.load(cos_ptr + offsets_all, mask=mask_batch, other=0.0).to(tl.float32)
     sin_tile = tl.load(sin_ptr + offsets_all, mask=mask_batch, other=0.0).to(tl.float32)
 
     # cos_1/sin_1: first half [0:half_dim], sequential access
-    cos_1 = tle.dsa.extract_slice(cos_tile, (0, 0), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 1))
-    sin_1 = tle.dsa.extract_slice(sin_tile, (0, 0), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 1))
+    cos_1 = tle.dsa.extract_slice(
+        cos_tile, (0, 0), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 1)
+    )
+    sin_1 = tle.dsa.extract_slice(
+        sin_tile, (0, 0), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 1)
+    )
 
     # cos_2/sin_2: second half [half_dim:HEAD_DIM], sequential access
-    cos_2 = tle.dsa.extract_slice(cos_tile, (0, HALF_PADDED_HEAD_DIM), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 1))
-    sin_2 = tle.dsa.extract_slice(sin_tile, (0, HALF_PADDED_HEAD_DIM), (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM), (1, 1))
+    cos_2 = tle.dsa.extract_slice(
+        cos_tile,
+        (0, HALF_PADDED_HEAD_DIM),
+        (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM),
+        (1, 1),
+    )
+    sin_2 = tle.dsa.extract_slice(
+        sin_tile,
+        (0, HALF_PADDED_HEAD_DIM),
+        (BLOCK_SIZE_TOKEN, HALF_PADDED_HEAD_DIM),
+        (1, 1),
+    )
 
     # First half output: x1*cos_1 - x2*sin_1
     first_half = (x1 * cos_1 - x2 * sin_1).to(q_embed_ptr.dtype.element_ty)
@@ -125,7 +143,9 @@ def _apply_rotary_pos_emb_kernel(
         for i in tle.dsa.parallel(BLOCK_SIZE_TOKEN):
             offset_i = s_id_batch * BLOCK_SIZE_TOKEN + i
             if IS_ALIGNED:
-                reload_result = tle.dsa.extract_slice(result, (i, 0), (1, HEAD_DIM), (1, 1))
+                reload_result = tle.dsa.extract_slice(
+                    result, (i, 0), (1, HEAD_DIM), (1, 1)
+                )
                 reload_result = tl.reshape(reload_result, (HEAD_DIM))
 
                 k_cache_offset = tle.dsa.extract_element(index_value, (i,)) * HEAD_DIM
@@ -133,19 +153,23 @@ def _apply_rotary_pos_emb_kernel(
                 tl.store(k_cache_ptr + k_cache_offset + row_ids, reload_result)
             else:
                 if offset_i < token_num:
-                    reload_result = tle.dsa.extract_slice(result, (i, 0), (1, HEAD_DIM), (1, 1))
+                    reload_result = tle.dsa.extract_slice(
+                        result, (i, 0), (1, HEAD_DIM), (1, 1)
+                    )
                     reload_result = tl.reshape(reload_result, (HEAD_DIM))
 
-                    k_cache_offset = tle.dsa.extract_element(index_value, (i,)) * HEAD_DIM
+                    k_cache_offset = (
+                        tle.dsa.extract_element(index_value, (i,)) * HEAD_DIM
+                    )
 
                     tl.store(k_cache_ptr + k_cache_offset + row_ids, reload_result)
 
 
 def apply_rotary_pos_emb(q, cos, sin, cache_mode, index, k_cache):
     """Apply rotary position embedding to the RoPE part and update k_cache."""
-    assert cos.shape[-1] == sin.shape[-1], (
-        f"cos and sin must have the same last dimension, got {cos.shape} and {sin.shape}"
-    )
+    assert (
+        cos.shape[-1] == sin.shape[-1]
+    ), f"cos and sin must have the same last dimension, got {cos.shape} and {sin.shape}"
     assert cos.stride(-1) == 1, "cos must be contiguous at the last dimension"
     assert sin.stride(-1) == 1, "sin must be contiguous at the last dimension"
 
@@ -220,7 +244,9 @@ def _rms_norm_kernel(
 
         mask = pid_offset < token_num
         cols = tl.arange(0, BLOCK_SIZE)
-        x = tl.load(in_ptr + pid_offset * x_stride_r + cols * x_stride_c, mask, other=0.0).to(cdtype)
+        x = tl.load(
+            in_ptr + pid_offset * x_stride_r + cols * x_stride_c, mask, other=0.0
+        ).to(cdtype)
 
         var = tl.sum(x * x, axis=1) * (1 / N)
         rrms = tl.sqrt(var + eps)
@@ -236,7 +262,9 @@ def _rms_norm_kernel(
                 offset_i = pid * BLOCK_SIZE_TOKEN + j * BLOCK_SIZE_TOKEN_PER + i
                 if IS_ALIGNED:
                     # Get the global token position in the KV cache.
-                    value_reload = tle.dsa.extract_slice(y, (i, 0), (1, BLOCK_SIZE), (1, 1))
+                    value_reload = tle.dsa.extract_slice(
+                        y, (i, 0), (1, BLOCK_SIZE), (1, 1)
+                    )
                     tl.compile_hint(value_reload, "disable_bubble_up")
                     value_reload = tl.reshape(value_reload, (BLOCK_SIZE))
 
@@ -246,7 +274,9 @@ def _rms_norm_kernel(
                     tl.store(kv_cache_ptr + k_cache_offset, value_reload)
                 else:
                     if offset_i < token_num:
-                        value_reload = tle.dsa.extract_slice(y, (i, 0), (1, BLOCK_SIZE), (1, 1))
+                        value_reload = tle.dsa.extract_slice(
+                            y, (i, 0), (1, BLOCK_SIZE), (1, 1)
+                        )
                         tl.compile_hint(value_reload, "disable_bubble_up")
                         value_reload = tl.reshape(value_reload, (BLOCK_SIZE))
 
@@ -341,7 +371,9 @@ def kv_rmsnorm_rope_cache(
     if cache_mode_map[cache_mode] != CACHE_MODE_PA:
         raise NotImplementedError("only the PA / PA_BNSD cache mode is implemented")
 
-    rope_embedding_value = apply_rotary_pos_emb(kv, cos, sin, cache_mode, index, k_cache)
+    rope_embedding_value = apply_rotary_pos_emb(
+        kv, cos, sin, cache_mode, index, k_cache
+    )
 
     rms_norm_out = rms_norm(kv, gamma, index, ckv_cache, cache_mode, epsilon)
     if is_output_kv:
