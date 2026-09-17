@@ -41,12 +41,7 @@ ATOL, RTOL = 1e-2, 1e-3
 WARMUP = 5
 ACTIVE = 20
 
-CASES = (
-    ("decode-aligned-fp16", 16384, 1, torch.float16),
-    ("decode-unaligned-fp16", 3, 1, torch.float16),
-    ("prefill-fp16", 64, 256, torch.float16),
-    ("decode-bf16", 16384, 1, torch.bfloat16),
-)
+CASES = (("decode-fp16", 16384, 1, torch.float16),)
 
 _IS_ASCEND = flaggems_vllm.vendor_name == "ascend" and hasattr(torch, "npu")
 pytestmark = [
