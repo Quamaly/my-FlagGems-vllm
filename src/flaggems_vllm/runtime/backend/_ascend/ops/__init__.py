@@ -66,6 +66,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
+    compute_slot_mapping_parallel,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
 )
@@ -115,4 +118,5 @@ __all__ = [
     "scatter_conv_state",
     "paged_scatter_triton",
     "indexer_epilogue",
+    "compute_slot_mapping_parallel",
 ]
