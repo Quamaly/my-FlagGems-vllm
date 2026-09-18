@@ -42,6 +42,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_epilogue
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_conv_state
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_scatter import (
     scatter_conv_state,
@@ -109,4 +110,5 @@ __all__ = [
     "gather_conv_state",
     "scatter_conv_state",
     "paged_scatter_triton",
+    "indexer_epilogue",
 ]
