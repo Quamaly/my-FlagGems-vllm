@@ -38,6 +38,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
+    group_list_cumsum,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
@@ -127,4 +130,5 @@ __all__ = [
     "compute_slot_mapping_parallel",
     "unpack_seq_triton",
     "kpool_state_compress",
+    "group_list_cumsum",
 ]
