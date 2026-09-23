@@ -22,7 +22,16 @@ from tests.test_kpool_state_compress import _make_case, _reference
 
 from . import base
 
-torch_npu = pytest.importorskip("torch_npu")
+try:
+    import torch_npu  # noqa: F401
+
+    _NPU_AVAILABLE = torch.npu.is_available()
+except (ImportError, AttributeError):
+    _NPU_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(
+    not _NPU_AVAILABLE, reason="kpool_state_compress requires an Ascend NPU"
+)
 
 # Production context: GLM-5.3-Flash-W8A8 serving profile (random 16k-in /
 # 1k-out @ 4-way concurrency, TP16 + EP16, MTP spec=3).  Shape source:

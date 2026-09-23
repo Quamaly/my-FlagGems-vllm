@@ -21,7 +21,12 @@ import flaggems_vllm
 
 from .conftest import QUICK_MODE
 
-torch_npu = pytest.importorskip("torch_npu")
+try:
+    import torch_npu  # noqa: F401
+
+    _NPU_AVAILABLE = torch.npu.is_available()
+except (ImportError, AttributeError):
+    _NPU_AVAILABLE = False
 
 CHUNK = 64
 # H=4 is the production per-rank head count ([1,T,4,128] with A_log[4] /
@@ -58,7 +63,7 @@ FULL_CASES = (
 CASES = (FULL_CASES[0], FULL_CASES[1], FULL_CASES[4]) if QUICK_MODE else FULL_CASES
 
 pytestmark = pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "ascend",
+    flaggems_vllm.vendor_name != "ascend" or not _NPU_AVAILABLE,
     reason="the optimized KDA gate cumsum targets Ascend",
 )
 

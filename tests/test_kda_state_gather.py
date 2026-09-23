@@ -19,7 +19,12 @@ import flaggems_vllm
 
 from .conftest import QUICK_MODE
 
-torch_npu = pytest.importorskip("torch_npu")
+try:
+    import torch_npu  # noqa: F401
+
+    _NPU_AVAILABLE = torch.npu.is_available()
+except (ImportError, AttributeError):
+    _NPU_AVAILABLE = False
 
 # Production context: GLM-5.3-Flash-W8A8 serving profile (random 16k-in /
 # 1k-out @ 4-way concurrency, TP16 + EP16, MTP spec=3).  Shape source:
@@ -49,7 +54,7 @@ FULL_CASES = (
 CASES = (FULL_CASES[0], FULL_CASES[1]) if QUICK_MODE else FULL_CASES
 
 pytestmark = pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "ascend",
+    flaggems_vllm.vendor_name != "ascend" or not _NPU_AVAILABLE,
     reason="the optimized KDA state gather targets Ascend",
 )
 

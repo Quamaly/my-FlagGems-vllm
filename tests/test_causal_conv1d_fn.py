@@ -30,7 +30,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
-pytest.importorskip("torch_npu")
+try:
+    import torch_npu  # noqa: F401
+
+    _NPU_AVAILABLE = torch.npu.is_available()
+except (ImportError, AttributeError):
+    _NPU_AVAILABLE = False
 import torch.nn.functional as F  # noqa: E402
 
 import flaggems_vllm  # noqa: E402
@@ -38,7 +43,7 @@ import flaggems_vllm  # noqa: E402
 from .conftest import QUICK_MODE  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "ascend" or not torch.npu.is_available(),
+    flaggems_vllm.vendor_name != "ascend" or not _NPU_AVAILABLE,
     reason="causal_conv1d_fn requires an Ascend NPU",
 )
 

@@ -23,7 +23,16 @@ from tests.test_kda_gate_cumsum import HAS_ASCENDC, _ascendc
 
 from . import base
 
-torch_npu = pytest.importorskip("torch_npu")
+try:
+    import torch_npu  # noqa: F401
+
+    _NPU_AVAILABLE = torch.npu.is_available()
+except (ImportError, AttributeError):
+    _NPU_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(
+    not _NPU_AVAILABLE, reason="kda_gate_cumsum requires an Ascend NPU"
+)
 
 CHUNK = 64
 H, D = 4, 128  # production per-rank shape [1,T,4,128] (TP16-sharded heads)

@@ -17,7 +17,12 @@ import torch
 
 import flaggems_vllm
 
-torch_npu = pytest.importorskip("torch_npu")
+try:
+    import torch_npu  # noqa: F401
+
+    _NPU_AVAILABLE = torch.npu.is_available()
+except (ImportError, AttributeError):
+    _NPU_AVAILABLE = False
 
 HEAD_DIM = 128
 DEVICE = "npu"
@@ -44,7 +49,7 @@ CASES = (
 )
 
 pytestmark = pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "ascend",
+    flaggems_vllm.vendor_name != "ascend" or not _NPU_AVAILABLE,
     reason="the optimized kpool state compress targets Ascend",
 )
 
